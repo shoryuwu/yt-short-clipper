@@ -324,6 +324,18 @@ class YTShortClipperApp(ctk.CTk):
             width=36, height=18, command=self.update_hook_switch_text)
         self.hook_switch.pack(side="right")
         
+        # Gaming Mode toggle
+        gaming_row = ctk.CTkFrame(enhance_frame, fg_color="transparent")
+        gaming_row.pack(fill="x", padx=12, pady=(0, 10))
+        
+        ctk.CTkLabel(gaming_row, text="🎮 Gaming Mode", font=ctk.CTkFont(size=10), 
+            anchor="w").pack(side="left")
+        
+        self.gaming_var = ctk.BooleanVar(value=self.config.get("gaming_settings", {}).get("enabled", False))
+        self.gaming_switch = ctk.CTkSwitch(gaming_row, text="", variable=self.gaming_var, 
+            width=36, height=18, command=self.update_gaming_switch)
+        self.gaming_switch.pack(side="right")
+        
         # ===== BOTTOM: Generate button + Browse =====
         bottom_section = ctk.CTkFrame(page, fg_color="transparent")
         bottom_section.pack(fill="x", padx=20, pady=(0, 5))
@@ -788,6 +800,23 @@ class YTShortClipperApp(ctk.CTk):
             # Fallback to main client for backward compatibility
             return self.client
     
+    def update_gaming_switch(self):
+        """Update gaming mode setting in config when switch is toggled"""
+        enabled = self.gaming_var.get()
+        
+        # Get existing gaming settings or create new
+        gaming_settings = self.config.get("gaming_settings", {
+            "enabled": False,
+            "facecam_position": "bottom",
+            "ratio": "60-40",
+            "facecam_source": "auto"
+        })
+        gaming_settings["enabled"] = enabled
+        
+        # Use ConfigManager.set() which auto-saves
+        self.config.set("gaming_settings", gaming_settings)
+        debug_log(f"Gaming mode {'enabled' if enabled else 'disabled'}")
+    
     def on_url_change(self, *args):
         url = self.url_var.get().strip()
         video_id = extract_video_id(url)
@@ -1246,10 +1275,8 @@ class YTShortClipperApp(ctk.CTk):
         """Start processing after validation passed"""
         self.start_btn.configure(state="normal", text="Generate Shorts")
         
-        # Legacy validation (backward compatibility)
-        if not self.client:
-            messagebox.showerror("Error", "Configure API settings first!\nClick ⚙️ button.")
-            return
+        # Note: API validation is already done in validate_and_start()
+        # Legacy self.client check removed - multi-provider config is now primary
         
         url = self.url_var.get().strip()
         if not extract_video_id(url):
@@ -1312,6 +1339,13 @@ class YTShortClipperApp(ctk.CTk):
                 "center_weight": 0.3
             })
             
+            gaming_settings = self.config.get("gaming_settings", {
+                "enabled": False,
+                "facecam_position": "bottom",
+                "ratio": "60-40",
+                "facecam_source": "bottom-right"
+            })
+            
             core = AutoClipperCore(
                 client=self.client,
                 ffmpeg_path=get_ffmpeg_path(),
@@ -1324,6 +1358,7 @@ class YTShortClipperApp(ctk.CTk):
                 watermark_settings=watermark_settings,
                 credit_watermark_settings=credit_watermark_settings,
                 face_tracking_mode=face_tracking_mode,
+                gaming_settings=gaming_settings,
                 mediapipe_settings=mediapipe_settings,
                 ai_providers=self.config.get("ai_providers"),
                 subtitle_language=subtitle_lang,

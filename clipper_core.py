@@ -75,6 +75,7 @@ class AutoClipperCore:
         watermark_settings: dict = None,
         credit_watermark_settings: dict = None,
         face_tracking_mode: str = "opencv",
+        gaming_settings: dict = None,
         mediapipe_settings: dict = None,
         ai_providers: dict = None,
         subtitle_language: str = "id",
@@ -137,6 +138,12 @@ class AutoClipperCore:
             "switch_threshold": 0.3,
             "min_shot_duration": 90,
             "center_weight": 0.3
+        }
+        self.gaming_settings = gaming_settings or {
+            "enabled": False,
+            "facecam_position": "bottom",  # "top" or "bottom"
+            "ratio": "60-40",              # gameplay-facecam ratio
+            "facecam_source": "auto"       # "auto" for dynamic tracking, or fixed: "top-left", "top-right", "bottom-left", "bottom-right"
         }
         self.subtitle_language = subtitle_language
         self.log = log_callback or print
@@ -283,7 +290,12 @@ Transcript:
             return
         
         if not srt_path:
-            raise Exception(f"No subtitle found for language: {self.subtitle_language}")
+            # Fallback: Use Whisper API to generate transcript
+            self.log("  ⚠ No YouTube subtitle found, using Whisper to generate transcript...")
+            srt_path = self.generate_transcript_whisper(video_path)
+            
+            if not srt_path:
+                raise Exception(f"Failed to generate transcript. Please check Caption Maker (Whisper) API configuration.")
         
         # Step 2: Find highlights
         self.set_progress("Finding highlights...", 0.3)
@@ -636,6 +648,269 @@ Transcript:
             self.log(f"  Warning: No {self.subtitle_language} subtitle found")
         
         return str(video_path), str(srt_path) if srt_path else None, video_info
+    
+    def generate_transcript_whisper(self, video_path: str) -> str:
+        """Generate transcript using Whisper API when YouTube subtitle not available
+        
+        Args:
+            video_path: Path to the video file
+            
+        Returns:
+            Path to generated SRT file, or None if failed
+        """
+        self.log("  🎤 Transcribing with Whisper API...")
+        self.set_progress("Transcribing audio with Whisper...", 0.15)
+        
+        try:
+            # Step 1: Extract audio from video
+            audio_file = str(self.temp_dir / "audio_for_transcript.mp3")
+            
+            extract_cmd = [
+                self.ffmpeg_path, "-y",
+                "-i", video_path,
+                "-vn",  # No video
+                "-acodec", "libmp3lame",
+                "-ar", "16000",  # 16kHz sample rate for Whisper
+                "-ac", "1",  # Mono
+                "-b:a", "64k",  # Lower bitrate to reduce file size
+                audio_file
+            ]
+            
+            self.log("  Extracting audio...")
+            result = subprocess.run(extract_cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
+            
+            if result.returncode != 0:
+                self.log(f"  ✗ Audio extraction failed: {result.stderr[:200]}")
+                return None
+            
+            # Check file size (Whisper has 25MB limit)
+            audio_size = os.path.getsize(audio_file)
+            audio_size_mb = audio_size / (1024 * 1024)
+            self.log(f"  Audio file size: {audio_size_mb:.1f} MB")
+            
+            if audio_size_mb > 24:
+                self.log("  ⚠ Audio file too large for Whisper API (>25MB)")
+                self.log("  Splitting audio into chunks...")
+                return self._transcribe_large_audio(audio_file)
+            
+            # Step 2: Get audio duration for token reporting
+            probe_cmd = [self.ffmpeg_path, "-i", audio_file, "-f", "null", "-"]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
+            duration_match = re.search(r"Duration: (\d+):(\d+):(\d+\.?\d*)", probe_result.stderr)
+            audio_duration = 0
+            if duration_match:
+                h, m, s = duration_match.groups()
+                audio_duration = int(h) * 3600 + int(m) * 60 + float(s)
+                self.report_tokens(0, 0, audio_duration, 0)
+                self.log(f"  Audio duration: {audio_duration:.1f}s")
+            
+            # Step 3: Call Whisper API
+            self.log(f"  Sending to Whisper API ({self.whisper_model})...")
+            self.set_progress("Whisper API transcribing...", 0.20)
+            
+            with open(audio_file, "rb") as f:
+                transcript = self.caption_client.audio.transcriptions.create(
+                    model=self.whisper_model,
+                    file=f,
+                    language=self.subtitle_language,  # e.g., "id" for Indonesian
+                    response_format="srt"  # Get SRT format directly
+                )
+            
+            # Step 4: Save SRT file
+            srt_path = str(self.temp_dir / f"source.{self.subtitle_language}.srt")
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(transcript)
+            
+            # Cleanup
+            if os.path.exists(audio_file):
+                os.unlink(audio_file)
+            
+            self.log(f"  ✓ Transcript generated successfully!")
+            return srt_path
+            
+        except Exception as e:
+            self.log(f"  ✗ Whisper transcription failed: {str(e)}")
+            return None
+    
+    def _transcribe_large_audio(self, audio_file: str) -> str:
+        """Transcribe large audio files by splitting into chunks
+        
+        Args:
+            audio_file: Path to the audio file
+            
+        Returns:
+            Path to generated SRT file, or None if failed
+        """
+        try:
+            # Get audio duration
+            probe_cmd = [self.ffmpeg_path, "-i", audio_file, "-f", "null", "-"]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
+            duration_match = re.search(r"Duration: (\d+):(\d+):(\d+\.?\d*)", probe_result.stderr)
+            
+            if not duration_match:
+                self.log("  ✗ Could not determine audio duration")
+                return None
+            
+            h, m, s = duration_match.groups()
+            total_duration = int(h) * 3600 + int(m) * 60 + float(s)
+            
+            # Split into 10-minute chunks (safe for 25MB limit)
+            chunk_duration = 600  # 10 minutes
+            num_chunks = int(total_duration / chunk_duration) + 1
+            
+            all_srt_content = []
+            time_offset = 0
+            srt_index = 1
+            
+            for i in range(num_chunks):
+                if self.is_cancelled():
+                    return None
+                
+                start_time = i * chunk_duration
+                chunk_file = str(self.temp_dir / f"audio_chunk_{i}.mp3")
+                
+                # Extract chunk
+                extract_cmd = [
+                    self.ffmpeg_path, "-y",
+                    "-i", audio_file,
+                    "-ss", str(start_time),
+                    "-t", str(chunk_duration),
+                    "-acodec", "libmp3lame",
+                    "-ar", "16000",
+                    "-ac", "1",
+                    "-b:a", "64k",
+                    chunk_file
+                ]
+                
+                self.log(f"  Processing chunk {i+1}/{num_chunks}...")
+                self.set_progress(f"Transcribing chunk {i+1}/{num_chunks}...", 0.15 + (i / num_chunks) * 0.10)
+                
+                result = subprocess.run(extract_cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
+                if result.returncode != 0:
+                    continue
+                
+                # Report audio duration for token usage
+                chunk_actual_duration = min(chunk_duration, total_duration - start_time)
+                self.report_tokens(0, 0, chunk_actual_duration, 0)
+                
+                # Transcribe chunk
+                try:
+                    with open(chunk_file, "rb") as f:
+                        chunk_transcript = self.caption_client.audio.transcriptions.create(
+                            model=self.whisper_model,
+                            file=f,
+                            language=self.subtitle_language,
+                            response_format="srt"
+                        )
+                    
+                    # Adjust timestamps in SRT and append
+                    adjusted_srt, srt_index = self._adjust_srt_timestamps(
+                        chunk_transcript, start_time, srt_index
+                    )
+                    all_srt_content.append(adjusted_srt)
+                    
+                except Exception as e:
+                    self.log(f"  ⚠ Chunk {i+1} failed: {str(e)[:50]}")
+                
+                # Cleanup chunk
+                if os.path.exists(chunk_file):
+                    os.unlink(chunk_file)
+            
+            # Cleanup original audio
+            if os.path.exists(audio_file):
+                os.unlink(audio_file)
+            
+            if not all_srt_content:
+                return None
+            
+            # Combine all SRT content
+            srt_path = str(self.temp_dir / f"source.{self.subtitle_language}.srt")
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(all_srt_content))
+            
+            self.log(f"  ✓ Large audio transcribed in {num_chunks} chunks")
+            return srt_path
+            
+        except Exception as e:
+            self.log(f"  ✗ Large audio transcription failed: {str(e)}")
+            return None
+    
+    def _adjust_srt_timestamps(self, srt_content: str, time_offset: float, start_index: int) -> tuple:
+        """Adjust SRT timestamps by adding time offset
+        
+        Args:
+            srt_content: Original SRT content
+            time_offset: Seconds to add to all timestamps
+            start_index: Starting index for SRT entries
+            
+        Returns:
+            Tuple of (adjusted SRT content, next index)
+        """
+        lines = srt_content.strip().split('\n')
+        adjusted_lines = []
+        current_index = start_index
+        
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # Skip empty lines
+            if not line:
+                i += 1
+                continue
+            
+            # Check if this is an index line (number)
+            if line.isdigit():
+                # Replace with our continuous index
+                adjusted_lines.append(str(current_index))
+                current_index += 1
+                i += 1
+                
+                # Next line should be timestamp
+                if i < len(lines):
+                    timestamp_line = lines[i].strip()
+                    # Parse and adjust timestamps: 00:00:00,000 --> 00:00:05,000
+                    match = re.match(r'(\d+):(\d+):(\d+),(\d+)\s*-->\s*(\d+):(\d+):(\d+),(\d+)', timestamp_line)
+                    if match:
+                        # Parse start time
+                        sh, sm, ss, sms = int(match.group(1)), int(match.group(2)), int(match.group(3)), int(match.group(4))
+                        start_seconds = sh * 3600 + sm * 60 + ss + sms / 1000 + time_offset
+                        
+                        # Parse end time  
+                        eh, em, es, ems = int(match.group(5)), int(match.group(6)), int(match.group(7)), int(match.group(8))
+                        end_seconds = eh * 3600 + em * 60 + es + ems / 1000 + time_offset
+                        
+                        # Format back to SRT timestamp
+                        def format_srt_time(seconds):
+                            h = int(seconds // 3600)
+                            m = int((seconds % 3600) // 60)
+                            s = int(seconds % 60)
+                            ms = int((seconds % 1) * 1000)
+                            return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+                        
+                        adjusted_timestamp = f"{format_srt_time(start_seconds)} --> {format_srt_time(end_seconds)}"
+                        adjusted_lines.append(adjusted_timestamp)
+                    else:
+                        adjusted_lines.append(timestamp_line)
+                    i += 1
+                
+                # Add subtitle text lines until next empty line or number
+                while i < len(lines):
+                    text_line = lines[i]
+                    if not text_line.strip():
+                        adjusted_lines.append("")
+                        i += 1
+                        break
+                    elif text_line.strip().isdigit() and i + 1 < len(lines) and '-->' in lines[i + 1]:
+                        # This is the next entry
+                        break
+                    else:
+                        adjusted_lines.append(text_line)
+                        i += 1
+            else:
+                i += 1
+        
+        return '\n'.join(adjusted_lines), current_index
 
     @staticmethod
     def get_available_subtitles(url: str, ytdlp_path: str = "yt-dlp", cookies_path: str = None) -> dict:
@@ -2166,7 +2441,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     def convert_to_portrait_with_progress(self, input_path: str, output_path: str, progress_callback):
         """Convert landscape to 9:16 portrait with speaker tracking and progress (router method)"""
         try:
-            if self.face_tracking_mode == "mediapipe":
+            # Check for gaming mode first
+            if self.gaming_settings.get("enabled", False):
+                self.log("  Using Gaming Layout Mode")
+                return self.convert_to_portrait_gaming_with_progress(input_path, output_path, progress_callback)
+            elif self.face_tracking_mode == "mediapipe":
                 self.log("  Using MediaPipe (Active Speaker Detection)")
                 return self.convert_to_portrait_mediapipe_with_progress(input_path, output_path, progress_callback)
             else:
@@ -2181,6 +2460,376 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             else:
                 raise
     
+    def convert_to_portrait_gaming_with_progress(self, input_path: str, output_path: str, progress_callback):
+        """Convert landscape gaming video to 9:16 portrait with split layout (gameplay + facecam)"""
+        
+        self.log("[DEBUG] Starting gaming layout conversion...")
+    
+        cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise Exception(f"Failed to open video: {input_path}")
+        
+        # Get raw video properties
+        raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        if total_frames == 0 or fps == 0:
+            cap.release()
+            raise Exception(f"Invalid video properties: {total_frames} frames, {fps} fps")
+            
+        # Analyze first valid frame for black borders (Global Crop)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, min(30, total_frames-1))  # Skip potential intro fade
+        ret, sample_frame = cap.read()
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, sample_frame = cap.read()
+            
+        # Detect crop area (global black bars removal)
+        crop_x, crop_y, crop_w, crop_h = 0, 0, raw_w, raw_h
+        if ret and sample_frame is not None:
+            crop_x, crop_y, crop_w, crop_h = self._detect_black_borders(sample_frame)
+            self.log(f"  Detected content area: x={crop_x}, y={crop_y}, w={crop_w}, h={crop_h}")
+        
+        # Update working dimensions to be the content area
+        orig_w = crop_w
+        orig_h = crop_h
+        
+        self.log(f"  Video content: {orig_w}x{orig_h}, {fps}fps, {total_frames} frames")
+        
+        # Parse gaming settings
+        facecam_position = self.gaming_settings.get("facecam_position", "bottom")
+        ratio_str = self.gaming_settings.get("ratio", "60-40")
+        facecam_source = self.gaming_settings.get("facecam_source", "bottom-right")
+        
+        # Parse ratio (e.g., "60-40" -> gameplay 60%, facecam 40%)
+        try:
+            gameplay_pct, facecam_pct = map(int, ratio_str.split("-"))
+        except:
+            gameplay_pct, facecam_pct = 60, 40
+        
+        self.log(f"  Layout: {facecam_position} facecam, {gameplay_pct}-{facecam_pct} ratio")
+        self.log(f"  Facecam source: {facecam_source}")
+        
+        # Output dimensions (9:16 portrait)
+        out_w, out_h = 1080, 1920
+        
+        # Calculate section heights based on ratio
+        if facecam_position == "top":
+            facecam_h = int(out_h * facecam_pct / 100)
+            gameplay_h = out_h - facecam_h
+        else:  # bottom
+            gameplay_h = int(out_h * gameplay_pct / 100)
+            facecam_h = out_h - gameplay_h
+        
+        self.log(f"  Output: gameplay {gameplay_h}px, facecam {facecam_h}px")
+        
+        # Calculate default facecam size (for corner scanning)
+        # Increased size to ensure we capture full head/face context
+        facecam_w_src = int(orig_w * 0.35)
+        facecam_h_src = int(orig_h * 0.45)
+        
+        # Define corner regions for scanning (Relative to CONTENT area)
+        corners = {
+            "bottom-right": (orig_w - facecam_w_src, orig_h - facecam_h_src, facecam_w_src, facecam_h_src),
+            "bottom-left": (0, orig_h - facecam_h_src, facecam_w_src, facecam_h_src),
+            "top-right": (orig_w - facecam_w_src, 0, facecam_w_src, facecam_h_src),
+            "top-left": (0, 0, facecam_w_src, facecam_h_src)
+        }
+        
+        # Face detector for dynamic detection
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        
+        # Initial facecam region (will be updated per-frame if auto)
+        if facecam_source in corners:
+            last_valid_region = corners[facecam_source]
+        else:
+            last_valid_region = corners["bottom-right"]
+        
+        self.log(f"  Dynamic facecam tracking: {'enabled' if facecam_source == 'auto' else 'disabled'}")
+        
+        # Reset video capture
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
+        # Create video writer using temp file
+        temp_video = str(Path(output_path).parent / "temp_gaming.avi")
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        out = cv2.VideoWriter(temp_video, fourcc, fps, (out_w, out_h))
+        
+        if not out.isOpened():
+            cap.release()
+            raise Exception("Failed to create video writer")
+        
+        # Process frames
+        frame_count = 0
+        detection_interval = 4  # Check every 4 frames (approx 0.13s at 30fps) for faster response
+        facecam_zoom_factor = 1.35  # Zoom in 35% on facecam to fill frame with face
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Apply global crop (remove black bars)
+            if crop_w > 0 and crop_h > 0:
+                frame = frame[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+                
+            # Dynamic facecam detection (every N frames for performance)
+            if facecam_source == "auto" and frame_count % detection_interval == 0:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                detected = False
+                
+                for corner_name, (cx, cy, cw, ch) in corners.items():
+                    corner_region = gray[cy:cy+ch, cx:cx+cw]
+                    faces = face_cascade.detectMultiScale(corner_region, 1.1, 3, minSize=(30, 30))
+                    
+                    if len(faces) > 0:
+                        last_valid_region = (cx, cy, cw, ch)
+                        detected = True
+                        if frame_count == 0:
+                            self.log(f"    Face detected at: {corner_name}")
+                        break
+                
+                if not detected and frame_count == 0:
+                    self.log(f"    ⚠ No face detected in corners, using default: bottom-right")
+            
+            # Use the current detected facecam region
+            facecam_region = last_valid_region if facecam_source == "auto" else corners.get(facecam_source, last_valid_region)
+            
+            # Extract gameplay (full frame)
+            gameplay_frame = frame
+            
+            # Extract facecam from detected region
+            fx, fy, fw, fh = facecam_region
+            facecam_frame = frame[fy:fy+fh, fx:fx+fw].copy()  # Use .copy() to ensure separate array
+            
+            # Debug: Log facecam region on first frame
+            if frame_count == 0:
+                self.log(f"    Facecam region: x={fx}, y={fy}, w={fw}, h={fh}")
+                self.log(f"    Facecam frame shape: {facecam_frame.shape}")
+            
+            # === GAMEPLAY: Crop-to-fill (no black bars) ===
+            gp_h_src, gp_w_src = gameplay_frame.shape[:2]
+            gp_src_aspect = gp_w_src / gp_h_src
+            gp_target_aspect = out_w / gameplay_h
+            
+            if gp_src_aspect > gp_target_aspect:
+                # Source is wider - crop sides
+                new_w = int(gp_h_src * gp_target_aspect)
+                x_start = (gp_w_src - new_w) // 2
+                gameplay_cropped = gameplay_frame[:, x_start:x_start+new_w]
+            else:
+                # Source is taller - crop top/bottom
+                new_h = int(gp_w_src / gp_target_aspect)
+                y_start = (gp_h_src - new_h) // 2
+                gameplay_cropped = gameplay_frame[y_start:y_start+new_h, :]
+            
+            gameplay_resized = cv2.resize(gameplay_cropped, (out_w, gameplay_h))
+            
+            # === FACECAM: Detect face and ZOOM crop ===
+            fc_h_src, fc_w_src = facecam_frame.shape[:2] if facecam_frame.shape[0] > 0 else (1, 1)
+            
+            if fc_h_src > 0 and fc_w_src > 0:
+                fc_target_aspect = out_w / facecam_h
+                
+                # 1. Determine base crop dimensions (crop to aspect ratio)
+                # This gives us the maximum area we COULD use
+                fc_src_aspect = fc_w_src / fc_h_src
+                
+                if fc_src_aspect > fc_target_aspect:
+                    # Source wider than target
+                    base_h = fc_h_src
+                    base_w = int(base_h * fc_target_aspect)
+                else:
+                    # Source taller than target
+                    base_w = fc_w_src
+                    base_h = int(base_w / fc_target_aspect)
+                
+                # 2. Apply Zoom Factor (crop smaller area to simulate zoom)
+                # Zoom 1.35x means we only use 1/1.35 of the available width/height
+                zoom_w = int(base_w / facecam_zoom_factor)
+                zoom_h = int(base_h / facecam_zoom_factor)
+                
+                # 3. Detect face to center the zoomed crop
+                fc_gray = cv2.cvtColor(facecam_frame, cv2.COLOR_BGR2GRAY)
+                faces_in_fc = face_cascade.detectMultiScale(fc_gray, 1.1, 3, minSize=(30, 30))
+                
+                if len(faces_in_fc) > 0:
+                    largest_face = max(faces_in_fc, key=lambda f: f[2] * f[3])
+                    face_x, face_y, face_w, face_h = largest_face
+                    # Focus higher (eye level)
+                    face_center_y = face_y + int(face_h * 0.4)
+                    face_center_x = face_x + face_w // 2
+                else:
+                    # Default: upper third
+                    face_center_y = fc_h_src // 3
+                    face_center_x = fc_w_src // 2
+                
+                # 4. Calculate crop coordinates (centered on face, clamped to bounds)
+                x_start = max(0, min(face_center_x - zoom_w // 2, fc_w_src - zoom_w))
+                y_start = max(0, min(face_center_y - zoom_h // 2, fc_h_src - zoom_h))
+                
+                facecam_cropped = facecam_frame[y_start:y_start+zoom_h, x_start:x_start+zoom_w]
+                facecam_resized = cv2.resize(facecam_cropped, (out_w, facecam_h))
+            else:
+                facecam_resized = np.zeros((facecam_h, out_w, 3), dtype=np.uint8)
+            
+            # Stack based on position setting (no canvas needed - both fill completely)
+            if facecam_position == "top":
+                output_frame = np.vstack([facecam_resized, gameplay_resized])
+            else:  # bottom
+                output_frame = np.vstack([gameplay_resized, facecam_resized])
+            
+            out.write(output_frame)
+            frame_count += 1
+            
+            # Report progress
+            if frame_count % 30 == 0 and progress_callback:
+                progress = frame_count / total_frames
+                progress_callback(progress)
+        
+        cap.release()
+        out.release()
+        
+        # Convert to MP4 with audio
+        self.log("  Encoding final video...")
+        
+        encoder_args = self.get_video_encoder_args()
+        cmd = [
+            self.ffmpeg_path, "-y",
+            "-i", temp_video,
+            "-i", input_path,
+            "-map", "0:v",
+            "-map", "1:a",
+            *encoder_args,
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest",
+            output_path
+        ]
+        
+        self.log_ffmpeg_command(cmd, "Gaming Layout Encode")
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=SUBPROCESS_FLAGS)
+        
+        if result.returncode != 0:
+            self.log(f"  ⚠ FFmpeg error: {result.stderr[:200]}")
+            raise Exception(f"FFmpeg failed: {result.stderr[:100]}")
+        
+        # Cleanup temp file
+        try:
+            os.unlink(temp_video)
+        except:
+            pass
+        
+        self.log("  ✓ Gaming layout conversion complete")
+        if progress_callback:
+            progress_callback(1.0)
+    
+    def _detect_black_borders(self, frame):
+        """Detect content area excluding black borders"""
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            # Threshold to find non-black pixels (tolerance 10)
+            _, thresh = cv2.threshold(gray, 10, 255, cv2.THRESH_BINARY)
+            
+            # Find bounding box of all non-zero pixels
+            coords = cv2.findNonZero(thresh)
+            
+            if coords is not None:
+                x, y, w, h = cv2.boundingRect(coords)
+                # Ensure we don't crop too aggressively (min size check)
+                if w > 100 and h > 100:
+                    return (x, y, w, h)
+            
+            h, w = frame.shape[:2]
+            return (0, 0, w, h)
+        except Exception as e:
+            self.log(f"  ⚠ Border detection failed: {e}")
+            h, w = frame.shape[:2]
+            return (0, 0, w, h)
+
+    def _detect_facecam_region(self, cap, location: str, width: int, height: int) -> tuple:
+        """Detect facecam region in gaming video
+        
+        Args:
+            cap: OpenCV VideoCapture
+            location: "auto", "top-left", "top-right", "bottom-left", "bottom-right"
+            width: Video width
+            height: Video height
+            
+        Returns:
+            Tuple of (x, y, w, h) for facecam region
+        """
+        # Default facecam size (typically 20-30% of video dimensions)
+        facecam_w = int(width * 0.25)
+        facecam_h = int(height * 0.30)
+        
+        if location == "bottom-right":
+            return (width - facecam_w, height - facecam_h, facecam_w, facecam_h)
+        elif location == "bottom-left":
+            return (0, height - facecam_h, facecam_w, facecam_h)
+        elif location == "top-right":
+            return (width - facecam_w, 0, facecam_w, facecam_h)
+        elif location == "top-left":
+            return (0, 0, facecam_w, facecam_h)
+        elif location == "auto":
+            # Try to auto-detect by looking for face in corners
+            return self._auto_detect_facecam(cap, width, height, facecam_w, facecam_h)
+        else:
+            # Default to bottom-right
+            return (width - facecam_w, height - facecam_h, facecam_w, facecam_h)
+    
+    def _auto_detect_facecam(self, cap, width: int, height: int, default_w: int, default_h: int) -> tuple:
+        """Auto-detect facecam location by looking for faces in corners"""
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        )
+        
+        # Sample a few frames
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 30)  # Skip first second
+        ret, frame = cap.read()
+        
+        if not ret:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            return (width - default_w, height - default_h, default_w, default_h)
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        
+        # Check each corner for faces
+        corners = {
+            "bottom-right": (width - default_w, height - default_h),
+            "bottom-left": (0, height - default_h),
+            "top-right": (width - default_w, 0),
+            "top-left": (0, 0)
+        }
+        
+        for corner_name, (cx, cy) in corners.items():
+            corner_region = gray[cy:cy+default_h, cx:cx+default_w]
+            faces = face_cascade.detectMultiScale(corner_region, 1.1, 3, minSize=(30, 30))
+            
+            if len(faces) > 0:
+                self.log(f"  Facecam detected at: {corner_name}")
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                return (cx, cy, default_w, default_h)
+        
+        # Default to bottom-right if no face detected
+        self.log("  No face detected, defaulting to bottom-right")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        return (width - default_w, height - default_h, default_w, default_h)
+    
+    def _extract_gameplay_region(self, frame, facecam_region: tuple, width: int, height: int):
+        """Extract gameplay region from frame, excluding facecam area
+        
+        For simplicity, we'll take the full frame and just scale it for gameplay.
+        The facecam will be shown separately.
+        """
+        # Simply return the full frame - we'll extract facecam separately
+        # This preserves the full gameplay view
+        return frame
+
     def convert_to_portrait_opencv_with_progress(self, input_path: str, output_path: str, progress_callback):
         """Convert landscape to 9:16 portrait with speaker tracking and progress (OpenCV)"""
         
